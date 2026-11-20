@@ -12,7 +12,7 @@ pi -e /home/alex/Repos/pi-rpc-subagents/extension.ts
 pi --continue -e /home/alex/Repos/pi-rpc-subagents/extension.ts
 ```
 
-Use `/subagents start <assignment>` to get a child ID, then `/subagents list` and `/subagents status <id>` for its state, last result, and any question ID. The parent model can also use `rpc_subagent`. A prompt acknowledgement is not completion or proof the model has read it.
+Use `/subagents start <assignment>` to get a child ID, then `/subagents list` and `/subagents status <id>` for its state, last result, and any question ID. The parent model can also use `rpc_subagent`. A prompt acknowledgement is not completion or proof the model has read it. If a prompt is not acknowledged, the plugin stops that child. Inspect its transcript before explicitly resuming; the prompt will not be replayed.
 
 | Command arguments after `/subagents` | Behavior |
 | --- | --- |

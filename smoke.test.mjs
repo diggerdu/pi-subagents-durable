@@ -46,9 +46,9 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
   const parents = [];
   try {
     await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { mock: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: "openai-completions", apiKey: "mock", models: [{ id: "test", name: "test", contextWindow: 32_000, maxTokens: 4096 }] } } }));
-    function parent(extra = []) {
+    function parent(extra = [], env = {}) {
       const child = spawn(pi, ["--offline", "--no-approve", "--no-mcp", "--no-extensions", "--no-skills", "--no-context-files", "--mode", "rpc", "--model", "mock/test", "--thinking", "off", "-e", extension, ...extra],
-        { cwd, env: { HOME: homedir(), PATH: process.env.PATH, PI_CODING_AGENT_DIR: agent, PI_TELEMETRY: "0" } });
+        { cwd, env: { HOME: homedir(), PATH: process.env.PATH, PI_CODING_AGENT_DIR: agent, PI_TELEMETRY: "0", ...env } });
       const closed = once(child, "close");
       parents.push({ child, closed });
       const events = [];
@@ -88,15 +88,15 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     const created = await p.command("start Ask two questions");
     assert.match(created, /^Subagent [a-f0-9-]+: prompt accepted/);
     const id = created.split(" ")[1].slice(0, -1);
-    async function status(expected, questionId) {
+    async function status(expected, questionText) {
       for (let i = 0; i < 50; i++) {
         const w = JSON.parse(await p.command(`status ${id}`));
-        if (w.state === expected && (!questionId || w.question?.id === questionId)) return w;
+        if (w.state === expected && (!questionText || w.question?.text === questionText)) return w;
         await delay(30);
       }
-      assert.fail(`Subagent did not reach ${expected} ${questionId ?? ""}.`);
+      assert.fail(`Subagent did not reach ${expected} ${questionText ?? ""}.`);
     }
-    const first = await status("needs_reply", "call_one");
+    const first = await status("needs_reply", "Which version?");
     const nested = requests.at(-1).tools.map(t => t.function.name).sort();
     assert.deepEqual(nested, ["ask_parent", "find", "grep", "ls", "read"]);
     const eventIndex = p.events.length;
@@ -104,9 +104,11 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     await p.find(e => e.type === "agent_settled", eventIndex);
     assert.match(await p.command(`answer ${id} stale Wrong`), /No matching live question/);
     assert.equal(JSON.parse(await p.command(`wait ${id}`)).state, "needs_reply");
-    assert.match(await p.command(`answer ${id} call_one Alpha`), /Reply sent/);
-    await status("needs_reply", "call_two");
-    assert.match(await p.command(`answer ${id} call_two Beta`), /Reply sent/);
+    assert.match(await p.command(`answer ${id} ${first.question.id} Alpha`), /Reply sent/);
+    const second = await status("needs_reply", "Which label?");
+    assert.notEqual(second.question.id, first.question.id);
+    assert.match(await p.command(`answer ${id} ${first.question.id} Wrong`), /No matching live question/);
+    assert.match(await p.command(`answer ${id} ${second.question.id} Beta`), /Reply sent/);
     const done = await status("idle");
     assert.match(done.result, /both replies/);
     assert.equal(done.question, undefined);
@@ -132,7 +134,7 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     assert.match(prior, /Alpha/);
     assert.match(prior, /Beta/);
     await p.command(`send ${id} Ask before crash`);
-    await status("needs_reply", "call_crash");
+    const pending = await status("needs_reply", "What to recover?");
     p.child.kill("SIGKILL");
     await p.closed;
     const crashRequests = requests.length;
@@ -144,11 +146,11 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
       await delay(30);
     }
     const restored = JSON.parse(await p.command(`status ${id}`));
-    assert.equal(restored.question.id, "call_crash");
+    assert.equal(restored.question.id, pending.question.id);
     assert.equal(restored.question.delivery, "uncertain");
     assert.equal(requests.length, crashRequests);
-    assert.match(await p.command(`answer ${id} call_crash stale`), /live child/);
-    const recovery = await p.command(`resume ${id} q=call_crash Recover explicitly`);
+    assert.match(await p.command(`answer ${id} ${pending.question.id} stale`), /live child/);
+    const recovery = await p.command(`resume ${id} q=${pending.question.id} Recover explicitly`);
     if (restored.state === "interrupted" && recovery.includes("stopped child")) {
       // Some container PID 1 implementations do not reap orphaned groups; fail closed.
       assert.equal(requests.length, crashRequests);
@@ -156,6 +158,40 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
       assert.match(recovery, /prompt accepted/);
       assert.match((await status("idle")).result, /saved question/);
     }
+
+    const mockWorker = join(tmp, "worker.mjs");
+    await writeFile(mockWorker, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+import { join } from "node:path";
+const emit = frame => process.stdout.write(JSON.stringify(frame) + "\\n");
+const dir = process.argv[process.argv.indexOf("--session-dir") + 1];
+let first = true;
+for await (const line of createInterface({ input: process.stdin })) {
+  const { type, id } = JSON.parse(line);
+  const reply = (success, data, error) => emit({ type: "response", id, success, data, error });
+  if (type === "get_state") reply(true, { sessionFile: join(dir, "test.jsonl"), sessionId: "test", model: { provider: "mock", id: "test" } });
+  else if (type === "prompt" && first) {
+    first = false;
+    reply(true);
+    emit({ type: "extension_ui_request", method: "input", id: "dialog", title: "pi-rpc-subagents:" + process.env.PI_RPC_SUBAGENT_TOKEN + ":" + JSON.stringify({ id: "test-question", text: "Has this been persisted?" }) });
+  } else if (type === "extension_ui_response") {
+    emit({ type: "message_end", message: { role: "toolResult", details: { answered: true, questionId: "test-question" } } });
+  } else if (type === "prompt") reply(false, undefined, "Rejected without agent_settled");
+  else reply(true);
+}
+`, { mode: 0o700 });
+    const failure = parent([], { PI_RPC_SUBAGENT_BIN: mockWorker });
+    const failureCreated = await failure.command("start Verify rejection handling");
+    const failureId = /^Subagent ([a-f0-9-]+): prompt accepted/.exec(failureCreated)?.[1];
+    assert.ok(failureId, failureCreated);
+    await failure.find(e => e.message?.includes?.("needs reply (test-question)"));
+    assert.match(await failure.command(`answer ${failureId} test-question Yes`), /Reply sent/);
+    assert.match(await failure.command(`send ${failureId} New instructions`), /Prompt not acknowledged/);
+    const stopped = JSON.parse(await failure.command(`status ${failureId}`));
+    assert.equal(stopped.state, "paused");
+    assert.equal(stopped.group, undefined);
+    assert.match(stopped.reason, /input will not be replayed/);
+    assert.equal(stopped.question?.delivery, "uncertain");
   } finally {
     for (const { child, closed } of parents) {
       if (!child.stdin.destroyed) child.stdin.end();

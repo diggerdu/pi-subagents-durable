@@ -21,7 +21,7 @@ type Worker = {
   question?: { id: string; text: string; delivery: "pending" | "uncertain" };
   result?: string; reason?: string;
 };
-type Live = { rpc: RpcChild; ctx: ExtensionContext; dialog?: string; expiry?: ReturnType<typeof setTimeout>; text?: string; failed?: boolean; pausing?: Promise<void> };
+type Live = { rpc: RpcChild; ctx: ExtensionContext; dialog?: string; expiry?: ReturnType<typeof setTimeout>; text?: string; failed?: boolean; answered?: string; prompting?: boolean; pausing?: Promise<void> };
 
 function privateDir(path: string) {
   mkdirSync(path, { mode: 0o700, recursive: true });
@@ -135,16 +135,17 @@ class Fleet {
       live.text = undefined;
       live.failed = false;
     } else if (frame.type === "message_end") {
-      const message = frame.message as { role?: string; toolCallId?: string; details?: { answered?: boolean }; stopReason?: string; content?: { type: string; text?: string }[] } | undefined;
-      if (message?.role === "toolResult" && message.toolCallId === w.question?.id && message.details?.answered) {
-        delete w.question;
-        this.save();
-      }
+      const message = frame.message as { role?: string; details?: { questionId?: string; answered?: boolean }; stopReason?: string; content?: { type: string; text?: string }[] } | undefined;
+      if (message?.role === "toolResult" && message.details?.answered) live.answered = message.details.questionId;
       if (message?.role === "assistant") {
         live.failed = message.stopReason === "error" || message.stopReason === "aborted";
         const text = message.content?.filter(c => c.type === "text").map(c => c.text).join("\n");
         if (text) live.text = clean(text);
       }
+    } else if (frame.type === "turn_end") {
+      // Pi emits message_end before persisting the tool result.
+      if (live.answered && w.question?.id === live.answered) { delete w.question; this.save(); }
+      delete live.answered;
     } else if (frame.type === "agent_settled") {
       clearTimeout(live.expiry);
       delete live.dialog;
@@ -200,22 +201,26 @@ class Fleet {
       await this.prompt(w, live, message);
       return `Subagent ${w.id}: prompt accepted, not completed.`;
     } catch (error) {
-      await this.pause(w);
+      if (this.live.get(w.id) === live) await this.pause(w);
       throw error;
     }
   }
 
   private async prompt(w: Worker, live: Live, text: string) {
-    w.state = "running";
-    w.reason = "Prompt delivery not yet acknowledged; never replay automatically.";
-    this.save();
+    if (live.prompting) throw new Error("A prompt is still awaiting acknowledgement.");
+    live.prompting = true;
     try {
-      await live.rpc.request("prompt", { message: text, streamingBehavior: "steer" });
-      if (w.reason?.startsWith("Prompt delivery")) { delete w.reason; this.save(); }
-    } catch (error) {
-      if (w.reason?.startsWith("Prompt delivery")) w.reason = "Prompt delivery uncertain. Inspect before retrying.";
-      try { this.save(); } catch { /* registry failure stops the fleet */ }
-      throw error;
+      w.state = "running";
+      this.save();
+      try {
+        await live.rpc.request("prompt", { message: text, streamingBehavior: "steer" });
+      } catch (error) {
+        const reason = "Prompt not acknowledged. Inspect the child transcript before explicitly resuming; input will not be replayed.";
+        if (this.live.get(w.id) === live) await (live.pausing ??= this.stopWorker(w, live, reason));
+        throw new Error(`${reason} ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      live.prompting = false;
     }
   }
 
@@ -227,7 +232,7 @@ class Fleet {
     return w.state;
   }
 
-  private async stopWorker(w: Worker, live: Live) {
+  private async stopWorker(w: Worker, live: Live, reason?: string) {
     const wasIdle = w.state === "idle";
     w.state = "stopping";
     if (w.question) w.question.delivery = "uncertain";
@@ -241,6 +246,7 @@ class Fleet {
         w.state = "interrupted";
         w.reason = "Child exit or group cleanup was not confirmed.";
       }
+      if (reason) w.reason = `${reason} ${w.reason ?? ""}`.trim();
       if (!this.failed) this.save();
     }
   }
