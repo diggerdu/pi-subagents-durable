@@ -1,0 +1,12 @@
+{
+  "name": "pi-rpc-subagents",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test smoke.test.mjs" },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.5.2 <2",
+    "typebox": "*"
+  },
+  "engines": { "node": ">=22.19" },
+  "pi": { "extensions": ["./extension.ts"] }
+}
