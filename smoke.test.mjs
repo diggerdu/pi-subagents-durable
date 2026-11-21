@@ -28,9 +28,14 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     const last = data.messages.at(-1);
     const user = data.messages.findLast(m => m.role === "user");
     const text = JSON.stringify(user?.content);
-    const tool = (id, question) => ({ tool_calls: [{ index: 0, id, type: "function", function: { name: "ask_parent", arguments: JSON.stringify({ question }) } }] });
+    const tool = (id, args, name = "ask_parent") => ({ tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(typeof args === "string" ? { question: args } : args) } }] });
     let delta;
-    if (last.role === "tool" && last.tool_call_id === "call_one") delta = tool("call_two", "Which label?");
+    if (last.role === "tool" && last.tool_call_id === "call_launch") delta = { content: "Worker dispatched." };
+    else if (last.role === "tool" && last.tool_call_id === "call_write") delta = tool("call_bash", { command: "test -f worker.txt && printf verified" }, "bash");
+    else if (last.role === "tool" && last.tool_call_id === "call_bash") delta = { content: "Write and Bash done." };
+    else if (text?.includes("Launch using the parent tool")) delta = tool("call_launch", { action: "start", model: "mock/worker", thinking: "xhigh", text: "Exercise built-in tools" }, "rpc_subagent");
+    else if (text?.includes("Exercise built-in tools")) delta = tool("call_write", { path: "worker.txt", content: "worker output\n" }, "write");
+    else if (last.role === "tool" && last.tool_call_id === "call_one") delta = tool("call_two", "Which label?");
     else if (last.role === "tool" && last.tool_call_id === "call_two") delta = { content: "Done with both replies." };
     else if (text?.includes("Explicit parent answer")) delta = { content: "Recovered from saved question." };
     else if (text?.includes("Inspect prior answers")) delta = { content: "Read old answers." };
@@ -45,7 +50,10 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
   await once(server, "listening");
   const parents = [];
   try {
-    await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { mock: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: "openai-completions", apiKey: "mock", models: [{ id: "test", name: "test", contextWindow: 32_000, maxTokens: 4096 }] } } }));
+    await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { mock: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: "openai-completions", apiKey: "mock", models: [
+      { id: "test", name: "test", contextWindow: 32_000, maxTokens: 4096 },
+      { id: "worker", name: "worker", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" }, contextWindow: 32_000, maxTokens: 4096 },
+    ] } } }));
     function parent(extra = [], env = {}) {
       const child = spawn(pi, ["--offline", "--no-approve", "--no-mcp", "--no-extensions", "--no-skills", "--no-context-files", "--mode", "rpc", "--model", "mock/test", "--thinking", "off", "-e", extension, ...extra],
         { cwd, env: { HOME: homedir(), PATH: process.env.PATH, PI_CODING_AGENT_DIR: agent, PI_TELEMETRY: "0", ...env } });
@@ -98,7 +106,7 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     }
     const first = await status("needs_reply", "Which version?");
     const nested = requests.at(-1).tools.map(t => t.function.name).sort();
-    assert.deepEqual(nested, ["ask_parent", "find", "grep", "ls", "read"]);
+    assert.deepEqual(nested, ["ask_parent", "bash", "edit", "find", "grep", "ls", "read", "write"]);
     const eventIndex = p.events.length;
     await p.rpc("prompt", { message: "Parent can take another turn now." });
     await p.find(e => e.type === "agent_settled", eventIndex);
@@ -158,6 +166,29 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
       assert.match(recovery, /prompt accepted/);
       assert.match((await status("idle")).result, /saved question/);
     }
+
+    const launchIndex = p.events.length;
+    await p.rpc("prompt", { message: "Launch using the parent tool" });
+    await p.find(e => e.type === "agent_settled", launchIndex);
+    const dispatched = await p.command("list");
+    const workerId = /^([a-f0-9-]+) \w+: Exercise built-in tools$/m.exec(dispatched)?.[1];
+    assert.ok(workerId, dispatched);
+    const worker = JSON.parse(await p.command(`wait ${workerId}`));
+    assert.equal(worker.state, "idle");
+    assert.equal(worker.model, "mock/worker");
+    assert.equal(worker.thinking, "xhigh");
+    assert.equal(worker.result, "Write and Bash done.");
+    const shellResult = requests.find(r => r.model === "worker" && r.messages.at(-1).tool_call_id === "call_bash");
+    assert.match(JSON.stringify(shellResult?.messages.at(-1).content) ?? "", /verified/);
+    assert.equal((await p.rpc("get_state")).model.id, "test");
+    assert.match(await p.command("start --model mock/missing No fallback"), /Unknown subagent model/);
+    assert.match(await p.command("start --model mock/test --thinking xhigh No fallback"), /Unsupported thinking level/);
+    const readonly = await p.command("start --model mock/worker --thinking xhigh --read-only Read-only job");
+    const readonlyId = /^Subagent ([a-f0-9-]+): prompt accepted/.exec(readonly)?.[1];
+    assert.ok(readonlyId, readonly);
+    assert.equal(JSON.parse(await p.command(`wait ${readonlyId}`)).state, "idle");
+    const readonlyRequest = requests.findLast(r => r.model === "worker" && JSON.stringify(r.messages.at(-1)).includes("Read-only job"));
+    assert.deepEqual(readonlyRequest?.tools.map(t => t.function.name).sort(), ["ask_parent", "find", "grep", "ls", "read"]);
 
     const mockWorker = join(tmp, "worker.mjs");
     await writeFile(mockWorker, `#!/usr/bin/env node

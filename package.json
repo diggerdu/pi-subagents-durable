@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": { "test": "node --test smoke.test.mjs" },
   "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.5.2 <2",
     "@earendil-works/pi-coding-agent": ">=1.5.2 <2",
     "typebox": "*"
   },
