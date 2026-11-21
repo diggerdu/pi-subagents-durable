@@ -37,7 +37,7 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     if (last.role === "tool" && last.tool_call_id === "call_launch") delta = { content: "Worker dispatched." };
     else if (last.role === "tool" && last.tool_call_id === "call_write") delta = tool("call_bash", { command: "test -f worker.txt && printf verified" }, "bash");
     else if (last.role === "tool" && last.tool_call_id === "call_bash") delta = { content: "Write and Bash done." };
-    else if (text?.includes("Launch using the parent tool")) delta = tool("call_launch", { action: "start", model: "mock/worker", thinking: "xhigh", text: "Exercise built-in tools" }, "rpc_subagent");
+    else if (text?.includes("Launch using the parent tool")) delta = tool("call_launch", { action: "start", model: "mock/worker", thinking: "xhigh", notifyOnCompletion: false, text: "Exercise built-in tools" }, "rpc_subagent");
     else if (text?.includes("Exercise built-in tools")) delta = tool("call_write", { path: "worker.txt", content: "worker output\n" }, "write");
     else if (last.role === "tool" && last.tool_call_id === "call_one") delta = tool("call_two", "Which label?");
     else if (last.role === "tool" && last.tool_call_id === "call_two") delta = { content: "Done with both replies." };
@@ -97,7 +97,7 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     await p.rpc("prompt", { message: "Initialize the parent history." });
     await p.find(e => e.type === "agent_settled");
     const state = await p.rpc("get_state");
-    const created = await p.command("start Ask two questions");
+    const created = await p.command("start --no-notify Ask two questions");
     assert.match(created, /^Subagent [a-f0-9-]+: prompt accepted/);
     const id = created.split(" ")[1].slice(0, -1);
     async function status(expected, questionText) {
@@ -187,7 +187,7 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     assert.equal((await p.rpc("get_state")).model.id, "test");
     assert.match(await p.command("start --model mock/missing No fallback"), /Unknown subagent model/);
     assert.match(await p.command("start --model mock/test --thinking xhigh No fallback"), /Unsupported thinking level/);
-    const readonly = await p.command("start --model mock/worker --thinking xhigh --read-only Read-only job");
+    const readonly = await p.command("start --model mock/worker --thinking xhigh --read-only --no-notify Read-only job");
     const readonlyId = /^Subagent ([a-f0-9-]+): prompt accepted/.exec(readonly)?.[1];
     assert.ok(readonlyId, readonly);
     assert.equal(JSON.parse(await p.command(`wait ${readonlyId}`)).state, "idle");
@@ -196,7 +196,7 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
 
     const notices = () => p.events.filter(e => e.type === "message_end" && e.message?.customType === "rpc-subagent-completion");
     assert.equal(notices().length, 0);
-    const notified = await p.command("start --notify --model mock/worker Report when idle");
+    const notified = await p.command("start --model mock/worker Report when idle");
     const notifiedId = /^Subagent ([a-f0-9-]+): prompt accepted/.exec(notified)?.[1];
     assert.ok(notifiedId, notified);
     const isNotice = e => e.type === "message_end" && e.message?.customType === "rpc-subagent-completion" && e.message.content.includes(notifiedId);
