@@ -20,6 +20,7 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
   await mkdir(agent);
   await mkdir(cwd);
   const requests = [];
+  let finishParent;
   const server = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
@@ -28,6 +29,9 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     const last = data.messages.at(-1);
     const user = data.messages.findLast(m => m.role === "user");
     const text = JSON.stringify(user?.content);
+    if (last.role === "user" && text?.includes("Hold the parent turn")) {
+      await new Promise(resolve => { finishParent = resolve; });
+    }
     const tool = (id, args, name = "ask_parent") => ({ tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(typeof args === "string" ? { question: args } : args) } }] });
     let delta;
     if (last.role === "tool" && last.tool_call_id === "call_launch") delta = { content: "Worker dispatched." };
@@ -189,6 +193,39 @@ test("Pi RPC: background questions, stop/archive, exact transcript recovery, no 
     assert.equal(JSON.parse(await p.command(`wait ${readonlyId}`)).state, "idle");
     const readonlyRequest = requests.findLast(r => r.model === "worker" && JSON.stringify(r.messages.at(-1)).includes("Read-only job"));
     assert.deepEqual(readonlyRequest?.tools.map(t => t.function.name).sort(), ["ask_parent", "find", "grep", "ls", "read"]);
+
+    const notices = () => p.events.filter(e => e.type === "message_end" && e.message?.customType === "rpc-subagent-completion");
+    assert.equal(notices().length, 0);
+    const notified = await p.command("start --notify --model mock/worker Report when idle");
+    const notifiedId = /^Subagent ([a-f0-9-]+): prompt accepted/.exec(notified)?.[1];
+    assert.ok(notifiedId, notified);
+    const isNotice = e => e.type === "message_end" && e.message?.customType === "rpc-subagent-completion" && e.message.content.includes(notifiedId);
+    const firstNotice = await p.find(isNotice);
+    await p.find(e => e.type === "agent_settled", p.events.indexOf(firstNotice));
+    assert.equal(notices().length, 1);
+    assert.equal(JSON.parse(await p.command(`status ${notifiedId}`)).state, "idle");
+
+    const busyIndex = p.events.length;
+    await p.rpc("prompt", { message: "Hold the parent turn" });
+    for (let i = 0; i < 100 && !finishParent; i++) await delay(20);
+    assert.ok(finishParent, "Parent turn did not reach mock provider.");
+    try {
+      assert.match(await p.command(`send ${notifiedId} Report while busy`), /Prompt accepted/);
+      await p.find(e => e.message?.includes?.(`Background subagent ${notifiedId}: idle`), busyIndex);
+      assert.equal(notices().length, 1);
+    } finally {
+      finishParent();
+    }
+    const secondNotice = await p.find(isNotice, busyIndex);
+    await p.find(e => e.type === "agent_settled", p.events.indexOf(secondNotice));
+    assert.equal(notices().length, 2);
+    p.child.stdin.end();
+    await p.closed;
+    const beforeNotifyRestore = requests.length;
+    p = parent(["--continue"]);
+    assert.match(await p.command("list"), new RegExp(`${notifiedId} paused`));
+    assert.equal(requests.length, beforeNotifyRestore);
+    assert.equal(notices().length, 0);
 
     const mockWorker = join(tmp, "worker.mjs");
     await writeFile(mockWorker, `#!/usr/bin/env node
